@@ -35,6 +35,10 @@ st.subheader("Customization Options")
 resume_template = st.selectbox("Select Resume Template", [
                                "Classic", "Modern", "Creative"])
 tone = st.radio("Preferred Tone", ["Professional", "Creative", "Enthusiastic"])
+# Workaround controls when OpenAI quota is exhausted
+use_mock = st.checkbox("Use mock responses (no OpenAI calls)", value=False)
+max_tokens = st.number_input(
+    "Max tokens (for OpenAI requests)", min_value=50, max_value=2000, value=500, step=50)
 
 st.subheader("Generated Content")
 # Use st.empty() to create containers for the output
@@ -79,29 +83,145 @@ for i in range(num_projects):
 
 generate_button = st.button("Generate Content")
 
+# Small utility: validate the OpenAI API key with a very cheap API call
+
+
+def validate_api_key():
+    """Validate the configured OpenAI API key using a low-cost API call.
+    Returns (ok: bool, message: str).
+    """
+    # Reuse the same key resolution logic as generate_text
+    key = os.getenv("OPENAI_API_KEY")
+    try:
+        if not key and hasattr(st, "secrets"):
+            key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        pass
+
+    if not key:
+        return False, "No API key found in environment or Streamlit secrets."
+
+    # Try new OpenAI client first (openai>=1.0.0)
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=key)
+        # models.list is cheap and suitable for validation
+        client.models.list()
+        return True, "OpenAI API key is valid (new client)."
+    except Exception as e_new:
+        # Fallback to older openai package interfaces
+        try:
+            openai.api_key = key
+            # older SDK exposes Model.list()
+            openai.Model.list()
+            return True, "OpenAI API key is valid (old client)."
+        except Exception as e_old:
+            # Prefer to return the newer exception message but include both
+            msg = f"Validation failed. New client error: {e_new}; Fallback error: {e_old}"
+            return False, msg
+
+
+# Add a lightweight validate button so users can check their key without generating content
+if st.button("Validate API Key"):
+    with st.spinner("Validating API key..."):
+        ok, message = validate_api_key()
+        if ok:
+            st.success(message)
+        else:
+            st.error(message)
+
 # Function to generate text using the OpenAI API
 
 
-def generate_text(prompt):
+def generate_text(prompt, max_tokens_override=None, mock=False):
     """Generates text using the OpenAI API."""
-    openai_api_key = os.getenv(
-        "OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    # If mock mode is enabled, return a deterministic placeholder and avoid API calls
+    if mock:
+        return f"(MOCK) Generated content for prompt preview. Prompt starts: {prompt[:120]}..."
+    # Respect a max_tokens override from the UI
+    if max_tokens_override is None:
+        max_tokens_override = 500
+    # Try multiple locations for the API key: environment variable first, then Streamlit secrets
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    try:
+        # st.secrets behaves like a dict and may not exist in some runtimes
+        if not openai_api_key and hasattr(st, "secrets"):
+            openai_api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        # If accessing st.secrets fails for any reason, ignore and continue
+        openai_api_key = openai_api_key
+
     if not openai_api_key:
+        # Provide actionable instructions for Windows PowerShell and Streamlit secrets
         st.error(
-            "OpenAI API key not found. Please set the OPENAI_API_KEY environment variable or Streamlit secret.")
+            "OpenAI API key not found. Please add your key as an environment variable or in Streamlit secrets.")
+        # Diagnostic information (safe - does not reveal the key value)
+        try:
+            cwd = os.getcwd()
+            st.markdown(f"- Current working directory: `{cwd}`")
+        except Exception:
+            pass
+
+        # Show whether an env var exists (masked) to help debugging
+        try:
+            env_val = os.getenv("OPENAI_API_KEY")
+            if env_val:
+                masked = env_val[:4] + "..." + env_val[-4:]
+                st.markdown(
+                    f"- Environment variable `OPENAI_API_KEY` is set (masked): `{masked}`")
+            else:
+                st.markdown(
+                    "- Environment variable `OPENAI_API_KEY` is not set")
+        except Exception:
+            pass
+
+        # Show which top-level keys exist in st.secrets (if available)
+        try:
+            if hasattr(st, "secrets") and st.secrets:
+                try:
+                    secrets_keys = list(st.secrets.keys())
+                except Exception:
+                    secrets_keys = []
+                st.markdown(
+                    f"- Keys present in `st.secrets`: `{secrets_keys}`")
+            else:
+                st.markdown(
+                    "- `st.secrets` is empty or not available in this runtime")
+        except Exception:
+            pass
+
+        st.markdown("**Quick fix (temporary, PowerShell):**\n"
+                    "Copy and run the following in the same PowerShell window before starting Streamlit:\n\n"
+                    "```powershell\n$env:OPENAI_API_KEY=\"<your-key-here>\"\nstreamlit run app.py\n```")
+        st.markdown("**Persistent fix (recommended):** create `.streamlit/secrets.toml` in your project root with:\n\n"
+                    "```toml\nOPENAI_API_KEY=\"<your-key-here>\"\n```\n\n"
+                    "Then run `streamlit run app.py`.")
         return None
 
     try:
-        # Configure the OpenAI package with the API key and call the ChatCompletion API
-        openai.api_key = openai_api_key
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            n=1,
-            stop=None,
-            temperature=0.7,
-        )
+        # Prefer the new OpenAI client (openai>=1.0.0)
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=openai_api_key)
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens_override,
+                temperature=0.7,
+            )
+        except Exception:
+            # Fallback for older openai versions (pre-1.0.0)
+            openai.api_key = openai_api_key
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens_override,
+                n=1,
+                stop=None,
+                temperature=0.7,
+            )
 
         # Response structure: response.choices[0].message.content
         if response and getattr(response, "choices", None):
@@ -205,9 +325,12 @@ Format the output using markdown or basic HTML for structure (e.g., headings, li
 
     # Generate content using the AI model
     with st.spinner("Generating content..."):
-        generated_resume = generate_text(resume_prompt)
-        generated_cover_letter = generate_text(cover_letter_prompt)
-        generated_portfolio = generate_text(portfolio_prompt)
+        generated_resume = generate_text(
+            resume_prompt, max_tokens_override=max_tokens, mock=use_mock)
+        generated_cover_letter = generate_text(
+            cover_letter_prompt, max_tokens_override=max_tokens, mock=use_mock)
+        generated_portfolio = generate_text(
+            portfolio_prompt, max_tokens_override=max_tokens, mock=use_mock)
 
     # Update the output sections using the containers created earlier
     if generated_resume:
